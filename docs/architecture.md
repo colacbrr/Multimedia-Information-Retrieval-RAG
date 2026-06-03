@@ -4,12 +4,12 @@
 
 The demo is an end-to-end pipeline for semantic multimedia retrieval with grounded response generation.
 
-The currently implemented modality is image search. The structure already anticipates future expansion toward video and audio.
+The implemented modalities are image search and video search. The structure still anticipates future expansion toward audio.
 
 ```text
 query
   -> CLIP text encoder
-  -> FAISS retrieval
+  -> FAISS retrieval over image, video, frame, or caption vectors
   -> optional caption reranking
   -> retrieved context assembly
   -> Ollama explanation
@@ -20,7 +20,9 @@ query
 
 ### 1. Data Source
 
-The current dataset is based on MS COCO validation images and captions.
+The image dataset is based on MS COCO validation images and captions.
+
+The video extension uses local clips under `data/videos/`. Frames are extracted with OpenCV, embedded with CLIP, and aggregated into video-level vectors. Optional caption metadata is indexed separately for reranking and reverse retrieval.
 
 This gives the project:
 
@@ -30,20 +32,21 @@ This gives the project:
 
 ### 2. Embedding Generation
 
-Images are encoded through CLIP into normalized vector embeddings.
+Images and sampled video frames are encoded through CLIP into normalized vector embeddings.
 
-Queries are encoded with the same CLIP text encoder, which places both text and images in a shared semantic space.
+Queries are encoded with the same CLIP text encoder, which places text, images, and sampled frames in a shared semantic space.
 
-This is what makes text-to-image retrieval possible without a fixed class list.
+This is what makes text-to-image and text-to-video retrieval possible without a fixed class list.
 
 ### 3. Vector Index
 
-The embeddings are added to a FAISS index.
+The embeddings are added to FAISS indexes.
 
 The implementation supports:
 
 - flat inner-product search
 - HNSW-based approximate nearest-neighbor search
+- separate video-level, frame-level, and caption-level indexes for video retrieval
 
 This allows direct analysis of speed and quality tradeoffs.
 
@@ -53,9 +56,11 @@ At query time:
 
 1. the query is embedded
 2. FAISS returns the top-k nearest items
-3. captions and metadata are attached to the results
+3. captions, timestamps, frame previews, and metadata are attached to the results
 
 The returned set is semantic retrieval output rather than simple keyword matching.
+
+For reverse video-to-text retrieval, an uploaded or local clip is sampled into frames, encoded, pooled into a query vector, and matched against indexed caption vectors. If captions are missing, the service returns a visual-frame fallback.
 
 ### 5. Reranking
 
@@ -91,10 +96,11 @@ This gives the project a stronger engineering profile than a UI-only prototype.
 
 ## Current Limitations
 
-- the explanation context is limited to retrieved image metadata and captions
+- the explanation context is limited to retrieved media metadata, captions, and timestamps
 - there is no separate knowledge store or document chunk retrieval stage
 - explanation quality depends on retrieval quality and caption coverage
 - the local LLM stage is much slower than search
+- video quality depends on frame sampling density and clip/caption coverage
 
 ## Frontend Role
 

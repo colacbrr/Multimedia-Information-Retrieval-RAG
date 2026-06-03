@@ -1,23 +1,24 @@
 # Semantic Multimedia Retrieval System with Grounded Explanations
 
-This project is a local-first multimedia retrieval system that turns natural-language queries into image search results, then generates a grounded explanation over the retrieved evidence.
+This project is a local-first multimedia retrieval system for image and video search. It turns natural-language queries into ranked visual results, supports video-to-text retrieval from local clips, and generates grounded explanations over the retrieved evidence.
 
 It combines:
 
-- CLIP embeddings for shared text-image semantic space
+- CLIP embeddings for shared text-image and text-video semantic space
 - FAISS indexing for fast nearest-neighbor retrieval
 - caption-aware reranking for better result ordering
 - a local Ollama explanation layer over retrieved items
 - benchmark artifacts for latency and retrieval quality analysis
+- CLI tools for text-to-video retrieval, video-to-text retrieval, and evaluation
 
 ## What Problem This Solves
 
-Traditional keyword search is a poor fit for images. Users ask for meaning, scenes, actions, and concepts, while image files usually expose only weak metadata.
+Traditional keyword search is a poor fit for images and videos. Users ask for meaning, scenes, actions, and concepts, while media files usually expose only weak metadata.
 
 This project addresses that semantic gap by:
 
-1. encoding text queries and images into the same embedding space
-2. retrieving semantically similar images with vector search
+1. encoding text queries, images, and sampled video frames into compatible embedding spaces
+2. retrieving semantically similar images, videos, or video frames with vector search
 3. optionally reranking results using caption similarity
 4. generating an explanation from the retrieved evidence rather than from free-form hallucinated context
 
@@ -25,14 +26,16 @@ The result is a system that is more useful than raw vector search alone because 
 
 ## What The System Does
 
-Given a query such as `a dog playing in the park`, the system:
+Given a query such as `a dog playing in the park`, the system can search either images or videos:
 
 1. encodes the query with CLIP
-2. searches a FAISS index built from image embeddings
-3. attaches captions and metadata to the retrieved images
+2. searches a FAISS index built from image embeddings, video-level embeddings, or frame-level embeddings
+3. attaches captions, timestamps, frame previews, and metadata to the retrieved media
 4. optionally reranks results using caption embeddings
 5. sends the final retrieved context to a local Ollama model
 6. returns a structured explanation with a summary, uncertainty hint, and referenced retrieved items
+
+The video extension also supports reverse retrieval: a local clip is sampled, embedded, and matched against indexed caption/text evidence to produce video-to-text results and an optional summary.
 
 ## Why This Is Interesting
 
@@ -48,7 +51,7 @@ This is not only a UI demo. It is an end-to-end retrieval workflow with measurab
 ```text
 query
   -> CLIP text encoder
-  -> FAISS vector retrieval
+  -> FAISS vector retrieval over image, video, or frame embeddings
   -> optional caption reranking
   -> retrieved context assembly
   -> local Ollama explanation
@@ -57,8 +60,8 @@ query
 
 Main layers:
 
-- Embedding layer: CLIP text and image encoders
-- Retrieval layer: FAISS flat or HNSW index
+- Embedding layer: CLIP text, image, and sampled-frame encoders
+- Retrieval layer: FAISS flat or HNSW indexes for images, videos, frames, and captions
 - Reranking layer: caption similarity fusion
 - Explanation layer: local retrieval-grounded generation
 - Evaluation layer: stored benchmarks and runtime metrics
@@ -70,6 +73,7 @@ More detail:
 - [Demo Guide](docs/demo-guide.md)
 - [Results](docs/results.md)
 - [Workflow](docs/workflow.md)
+- [Video Retrieval](docs/video_retrieval.md)
 - [Research Notes](docs/research-notes.md)
 
 ## Recommended Project Title
@@ -84,6 +88,10 @@ Implemented:
 
 - image retrieval
 - text-to-image semantic search
+- video retrieval
+- text-to-video semantic search
+- frame-level video search with timestamp hints
+- video-to-text reverse retrieval for local clips
 - FAISS flat and HNSW support
 - caption-aware reranking
 - local explanation generation with Ollama
@@ -94,11 +102,10 @@ Implemented:
 
 Planned:
 
-- video retrieval
 - audio retrieval
 - richer hybrid search
 - stronger reranking
-- broader evaluation
+- broader video evaluation
 
 ## Complexity and Tradeoffs
 
@@ -108,6 +115,7 @@ Main complexity points:
 
 - embedding generation is compute-heavy and front-loaded
 - vector retrieval is fast but quality-sensitive to encoder choice and index size
+- video indexing requires frame extraction and can grow quickly with sampling rate
 - caption reranking improves precision but adds extra inference work
 - explanation depends on retrieved context quality
 - local LLM generation is much slower than retrieval and needs careful timeout, caching, and fallback behavior
@@ -144,7 +152,9 @@ These numbers matter because they make the tradeoff visible: retrieval remains i
 ```text
 backend/     FastAPI retrieval and explanation service
 frontend/    React + Vite interface
+scripts/     CLI tools for video indexing, search, reverse retrieval, and evaluation
 docs/        architecture, startup, results, workflow
+data/videos/ local video dataset placeholder, ignored except docs/metadata stubs
 assets/      screenshots and diagrams
 benchmarks/  stored evaluation outputs
 tests/       focused helper tests
@@ -190,7 +200,7 @@ The explanation layer will run only if Ollama is available and the selected mode
 
 ### Dataset
 
-The repository does not include the COCO image set or captions. The backend expects:
+The repository does not include media datasets. For image retrieval, the backend expects:
 
 ```text
 backend/val2017/
@@ -223,12 +233,46 @@ backend/
 
 Only `val2017/` and `annotations/captions_val2017.json` are required for the current image retrieval workflow.
 
+For video retrieval, place clips under:
+
+```text
+data/videos/
+  personal/
+  public/
+  annotations/captions.json
+```
+
+Captions are optional for visual search, but they improve reranking and enable stronger video-to-text reverse retrieval.
+
+Build and search the video index from the repo root:
+
+```bash
+python scripts/build_video_index.py --videos data/videos --mode both
+python scripts/search_video.py --query "people walking in a city" --top-k 5 --mode video
+python scripts/terminal_video_demo.py
+```
+
 ## API Quickstart
 
 Search:
 
 ```bash
 curl "http://localhost:8000/search?query=a%20dog%20playing%20in%20the%20park&top_k=5"
+```
+
+Video search:
+
+```bash
+curl "http://localhost:8000/video/search?query=people%20walking%20in%20a%20city&top_k=5&mode=video"
+curl "http://localhost:8000/search?query=people%20walking%20in%20a%20city&top_k=5&modality=video"
+```
+
+Video-to-text reverse retrieval from a local file path:
+
+```bash
+curl -X POST "http://localhost:8000/video/reverse-search" \
+  -H "Content-Type: application/json" \
+  -d '{ "video_path": "data/videos/public/sample_001.mp4", "top_k": 5 }'
 ```
 
 Generate a retrieval-grounded explanation:
@@ -251,6 +295,10 @@ Useful endpoints:
 - `/search`
 - `/rag`
 - `/explain`
+- `/video/status`
+- `/video/search`
+- `/video/reverse-search`
+- `/video/rag`
 - `/metrics`
 - `/metrics/summary`
 - `/benchmarks`
@@ -258,9 +306,9 @@ Useful endpoints:
 
 ## Limitations
 
-- current modality support is image-only
+- media datasets and generated indexes are not bundled in the repo
 - explanation quality is bounded by retrieval quality
-- dataset assets are not bundled in the repo
+- video search quality depends on frame sampling and available captions
 - local generation is significantly slower than retrieval
 - the current explanation layer is not yet a full citation-rich RAG stack
 
@@ -273,7 +321,7 @@ The most useful next steps for this repository are:
 - add a task runner such as a `Makefile` for setup, run, and test commands
 - add Docker or `docker-compose` for reproducible local startup
 - extend evaluation beyond retrieval latency and Recall@K
-- expand the system toward video and audio retrieval
+- expand the system toward audio retrieval
 
 ## License
 

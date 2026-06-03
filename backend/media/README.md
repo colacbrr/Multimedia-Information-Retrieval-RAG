@@ -1,7 +1,7 @@
 # Media library layout
 
 This folder defines the on-disk structure for media that will be indexed and
-served by search. Keep file paths in manifests relative to `mir_project/` so
+served by search. Keep file paths in manifests relative to the repository root so
 the backend can resolve them consistently across machines.
 
 ## Structure
@@ -30,7 +30,7 @@ so the search pipeline can re-use metadata across image/video/audio.
 Minimum fields:
 - `id`: unique string
 - `type`: `video` or `audio`
-- `path`: relative path to the main file under `mir_project/`
+- `path`: relative path to the main file under the repository root
 - `caption`: short description for search
 - `tags`: list of keywords
 - `source`: where the media came from

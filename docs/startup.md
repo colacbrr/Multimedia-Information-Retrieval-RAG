@@ -27,6 +27,7 @@ You also need the dataset files expected by the backend:
 
 - `backend/val2017/`
 - `backend/annotations/captions_val2017.json`
+- `data/videos/` for optional local video retrieval experiments
 
 And generated artifacts will be written under:
 
@@ -85,7 +86,19 @@ This project only needs:
 - `val2017/`
 - `annotations/captions_val2017.json`
 
-If these folders are missing, the backend can start, but retrieval will not work correctly.
+For video retrieval, place local clips under `data/videos/`. Captions are optional but recommended:
+
+```text
+data/videos/
+  personal/
+    clip_001.mp4
+  public/
+    sample_001.mp4
+  annotations/
+    captions.json
+```
+
+If the image folders are missing, image retrieval will not initialize. If `data/videos/` is empty, the backend still starts, but video indexes must be built after clips are added.
 
 ## 3. Start The Backend
 
@@ -108,6 +121,10 @@ Useful endpoints:
 - `/search`
 - `/rag`
 - `/explain`
+- `/video/status`
+- `/video/search`
+- `/video/reverse-search`
+- `/video/rag`
 - `/metrics/summary`
 - `/benchmarks`
 - `/ollama/models`
@@ -162,6 +179,10 @@ MIR_RERANK_ALPHA=0.25
 MIR_RAG_MODEL=llama3.1:8b
 MIR_RAG_TIMEOUT_SEC=45
 MIR_RAG_CACHE_TTL_SEC=300
+VIDEO_DATA_DIR=../data/videos
+VIDEO_ANNOTATIONS=../data/videos/annotations/captions.json
+VIDEO_SAMPLE_FPS=1
+VIDEO_FIXED_FRAMES=16
 ```
 
 Example startup:
@@ -196,6 +217,26 @@ Direct retrieval-plus-generation in one request:
 
 ```bash
 curl "http://localhost:8000/rag?query=sunset%20over%20the%20ocean&top_k=5&rerank=true"
+```
+
+Video index build from the repo root:
+
+```bash
+python scripts/build_video_index.py --videos data/videos --mode both
+```
+
+Video search:
+
+```bash
+curl "http://localhost:8000/video/search?query=people%20walking%20in%20a%20city&top_k=5&mode=video"
+```
+
+Reverse video-to-text retrieval:
+
+```bash
+curl -X POST "http://localhost:8000/video/reverse-search" \
+  -H "Content-Type: application/json" \
+  -d '{ "video_path": "data/videos/public/sample_001.mp4", "top_k": 5 }'
 ```
 
 ## 8. Common Issues

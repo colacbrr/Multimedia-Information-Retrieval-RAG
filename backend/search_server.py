@@ -1,6 +1,8 @@
 import json
 import random
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -13,6 +15,7 @@ import torch
 import clip
 from PIL import Image
 from fastapi import FastAPI, Query
+from fastapi import File, Form, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -39,6 +42,18 @@ from config import (
     RERANK_ALPHA,
     RERANK_ENABLED,
     SUPPORTED_MODALITIES,
+    VIDEO_ANNOTATIONS,
+    VIDEO_CAPTION_BATCH_SIZE,
+    VIDEO_DATA_DIR,
+    VIDEO_FIXED_FRAMES,
+    VIDEO_FRAME_BATCH_SIZE,
+    VIDEO_MAX_RESULTS,
+    VIDEO_OUTPUT_DIR,
+    VIDEO_RERANK_ALPHA,
+    VIDEO_SAMPLE_FPS,
+    VIDEO_SAMPLING_STRATEGY,
+    VIDEO_SAVE_FRAMES,
+    VIDEO_UPLOAD_BATCH_SIZE,
 )
 from metrics_utils import load_jsonl_events, summarize_events
 from rag import (
@@ -56,9 +71,18 @@ try:
 except Exception:
     ollama = None
 
+try:
+    from video import VideoRetrievalConfig, VideoRetrievalService
+    from video.inventory import collect_video_inventory
+except Exception:
+    VideoRetrievalConfig = None
+    VideoRetrievalService = None
+    collect_video_inventory = None
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
 COCO_IMAGES = BASE_DIR / "val2017"
 COCO_ANNOTATIONS = BASE_DIR / "annotations" / "captions_val2017.json"
 OUTPUTS_DIR = BASE_DIR / "outputs"
@@ -70,10 +94,36 @@ FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 FRONTEND_INDEX = FRONTEND_DIST / "index.html"
 BENCHMARK_1K = BASE_DIR.parent / "benchmarks" / "run_1000_metrics_eval.json"
 BENCHMARK_5K = BASE_DIR.parent / "benchmarks" / "run_5000_metrics_eval.json"
+VIDEO_DATA_PATH = (BASE_DIR / VIDEO_DATA_DIR).resolve() if not Path(VIDEO_DATA_DIR).is_absolute() else Path(VIDEO_DATA_DIR)
+VIDEO_ANNOTATIONS_PATH = (
+    (BASE_DIR / VIDEO_ANNOTATIONS).resolve()
+    if not Path(VIDEO_ANNOTATIONS).is_absolute()
+    else Path(VIDEO_ANNOTATIONS)
+)
+VIDEO_OUTPUTS_DIR = (
+    (BASE_DIR / VIDEO_OUTPUT_DIR).resolve()
+    if not Path(VIDEO_OUTPUT_DIR).is_absolute()
+    else Path(VIDEO_OUTPUT_DIR)
+)
+VIDEO_FRAMES_DIR = VIDEO_OUTPUTS_DIR / "frames"
+VIDEO_UPLOADS_DIR = VIDEO_OUTPUTS_DIR / "uploads"
+VIDEO_MANIFEST_FILE = VIDEO_OUTPUTS_DIR / "video_manifest.json"
+VIDEO_METRICS_LOG_FILE = VIDEO_OUTPUTS_DIR / "video_metrics.jsonl"
+VIDEO_FRAME_EMBEDDINGS_FILE = VIDEO_OUTPUTS_DIR / "video_frame_embeddings.npy"
+VIDEO_FRAME_METADATA_FILE = VIDEO_OUTPUTS_DIR / "video_frame_metadata.json"
+VIDEO_VIDEO_EMBEDDINGS_FILE = VIDEO_OUTPUTS_DIR / "video_video_embeddings.npy"
+VIDEO_VIDEO_METADATA_FILE = VIDEO_OUTPUTS_DIR / "video_video_metadata.json"
+VIDEO_CAPTION_EMBEDDINGS_FILE = VIDEO_OUTPUTS_DIR / "video_caption_embeddings.npy"
+VIDEO_CAPTION_METADATA_FILE = VIDEO_OUTPUTS_DIR / "video_caption_metadata.json"
+VIDEO_FRAME_INDEX_FILE = VIDEO_OUTPUTS_DIR / "faiss_frames.index"
+VIDEO_VIDEO_INDEX_FILE = VIDEO_OUTPUTS_DIR / "faiss_video.index"
+VIDEO_CAPTION_INDEX_FILE = VIDEO_OUTPUTS_DIR / "faiss_captions.index"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     threading.Thread(target=_load_or_build_index, daemon=True).start()
+    if video_service is not None:
+        threading.Thread(target=video_service.load_existing, daemon=True).start()
     yield
 
 
@@ -88,6 +138,12 @@ app.add_middleware(
 
 if COCO_IMAGES.exists():
     app.mount("/images", StaticFiles(directory=str(COCO_IMAGES)), name="images")
+if VIDEO_DATA_PATH.exists():
+    app.mount("/video-files", StaticFiles(directory=str(VIDEO_DATA_PATH)), name="video_files")
+VIDEO_OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+VIDEO_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+VIDEO_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/video-frames", StaticFiles(directory=str(VIDEO_FRAMES_DIR)), name="video_frames")
 if FRONTEND_DIST.exists():
     assets_dir = FRONTEND_DIST / "assets"
     if assets_dir.exists():
@@ -126,6 +182,59 @@ _metrics = {
 }
 _rag_cache = {}
 _rag_cache_lock = threading.Lock()
+_video_inventory_cache = {"ts": 0.0, "data": None}
+_video_inventory_lock = threading.Lock()
+
+
+def _get_clip_model():
+    global _model, _preprocess
+    if _model is None or _preprocess is None:
+        _set_progress("init", "Loading CLIP model")
+        _log(f"Device: {DEVICE}")
+        _model, _preprocess = clip.load(CLIP_MODEL_NAME, device=DEVICE)
+        _model.eval()
+    return _model, _preprocess
+
+
+def _get_device():
+    return DEVICE
+
+
+video_service = None
+if VideoRetrievalConfig is not None and VideoRetrievalService is not None:
+    video_service = VideoRetrievalService(
+        VideoRetrievalConfig(
+            base_dir=BASE_DIR,
+            data_dir=VIDEO_DATA_PATH,
+            annotations_path=VIDEO_ANNOTATIONS_PATH,
+            output_dir=VIDEO_OUTPUTS_DIR,
+            frames_dir=VIDEO_FRAMES_DIR,
+            manifest_path=VIDEO_MANIFEST_FILE,
+            frame_embeddings_path=VIDEO_FRAME_EMBEDDINGS_FILE,
+            frame_metadata_path=VIDEO_FRAME_METADATA_FILE,
+            video_embeddings_path=VIDEO_VIDEO_EMBEDDINGS_FILE,
+            video_metadata_path=VIDEO_VIDEO_METADATA_FILE,
+            caption_embeddings_path=VIDEO_CAPTION_EMBEDDINGS_FILE,
+            caption_metadata_path=VIDEO_CAPTION_METADATA_FILE,
+            frame_index_path=VIDEO_FRAME_INDEX_FILE,
+            video_index_path=VIDEO_VIDEO_INDEX_FILE,
+            caption_index_path=VIDEO_CAPTION_INDEX_FILE,
+            metrics_path=VIDEO_METRICS_LOG_FILE,
+            clip_model_name=CLIP_MODEL_NAME,
+            index_type=INDEX_TYPE,
+            sampling_strategy=VIDEO_SAMPLING_STRATEGY,
+            sample_fps=VIDEO_SAMPLE_FPS,
+            fixed_frames=VIDEO_FIXED_FRAMES,
+            save_frames=VIDEO_SAVE_FRAMES,
+            rerank_alpha=VIDEO_RERANK_ALPHA,
+            max_results=VIDEO_MAX_RESULTS,
+            frame_batch_size=VIDEO_FRAME_BATCH_SIZE,
+            caption_batch_size=VIDEO_CAPTION_BATCH_SIZE,
+            upload_batch_size=VIDEO_UPLOAD_BATCH_SIZE,
+        ),
+        model_provider=_get_clip_model,
+        device_provider=_get_device,
+    )
 
 
 class ExplainResultItem(BaseModel):
@@ -300,10 +409,7 @@ def _load_or_build_index():
             if not COCO_IMAGES.exists():
                 raise FileNotFoundError(f"Missing images folder: {COCO_IMAGES}")
 
-            _set_progress("init", "Loading CLIP model")
-            _log(f"Device: {DEVICE}")
-            _model, _preprocess = clip.load(CLIP_MODEL_NAME, device=DEVICE)
-            _model.eval()
+            _model, _preprocess = _get_clip_model()
 
             _set_progress("init", "Loading image list")
             if IMAGE_FILES_FILE.exists():
@@ -716,6 +822,7 @@ def status():
         "rag_timeout_sec": RAG_TIMEOUT_SEC,
         "rag_cache_ttl_sec": RAG_CACHE_TTL_SEC,
         "prompt_version": PROMPT_VERSION,
+        "video": video_service.status() if video_service is not None else {"ready": False, "error": "Video service unavailable"},
         "manifest": manifest,
         "metrics": {
             **_metrics,
@@ -760,6 +867,15 @@ def config():
         "rag_cache_ttl_sec": RAG_CACHE_TTL_SEC,
         "prompt_version": PROMPT_VERSION,
         "max_images": MAX_IMAGES,
+        "video": {
+            "data_dir": str(VIDEO_DATA_PATH),
+            "annotations_path": str(VIDEO_ANNOTATIONS_PATH),
+            "output_dir": str(VIDEO_OUTPUTS_DIR),
+            "sampling_strategy": VIDEO_SAMPLING_STRATEGY,
+            "sample_fps": VIDEO_SAMPLE_FPS,
+            "fixed_frames": VIDEO_FIXED_FRAMES,
+            "rerank_alpha_default": VIDEO_RERANK_ALPHA,
+        },
     }
 
 
@@ -815,6 +931,15 @@ def search(
     rerank_alpha: float = Query(RERANK_ALPHA, ge=0.0, le=1.0),
     modality: str = Query("image"),
 ):
+    if modality == "video":
+        return video_search(
+            query=query,
+            top_k=top_k,
+            mode="video",
+            rerank=rerank,
+            return_segments=True,
+            rerank_alpha=rerank_alpha,
+        )
     if modality not in SUPPORTED_MODALITIES:
         return _api_error(
             f"Unsupported modality '{modality}'.",
@@ -870,6 +995,18 @@ def rag(
     model: str | None = None,
     modality: str = Query("image"),
 ):
+    if modality == "video":
+        payload = video_search(
+            query=query,
+            top_k=top_k,
+            mode="video",
+            rerank=rerank,
+            return_segments=True,
+            rerank_alpha=rerank_alpha,
+        )
+        if not payload.get("ok", True) or payload.get("error"):
+            return payload
+        return video_rag({"query": query, "results": payload.get("results") or [], "model": model})
     if modality not in SUPPORTED_MODALITIES:
         return _api_error(
             f"Unsupported modality '{modality}'.",
@@ -1002,6 +1139,131 @@ def explain(payload: ExplainRequest):
         }
     )
     return response_payload
+
+
+@app.get("/video/status")
+def video_status():
+    if video_service is None:
+        return {"ok": False, "ready": False, "error": "Video service unavailable"}
+    return {"ok": True, **video_service.status()}
+
+
+@app.get("/video/inventory")
+def video_inventory():
+    if collect_video_inventory is None:
+        return {"ok": False, "error": "Video inventory unavailable"}
+    now = time.time()
+    with _video_inventory_lock:
+        cached = _video_inventory_cache["data"]
+        ts = float(_video_inventory_cache["ts"] or 0.0)
+        if cached is not None and now - ts < 30:
+            return {"ok": True, **cached}
+        payload = collect_video_inventory(PROJECT_ROOT)
+        _video_inventory_cache["ts"] = now
+        _video_inventory_cache["data"] = payload
+        return {"ok": True, **payload}
+
+
+@app.get("/video/search")
+def video_search(
+    query: str = Query(..., min_length=1),
+    top_k: int = Query(5, ge=1, le=50),
+    mode: str = Query("video"),
+    rerank: bool = Query(True),
+    return_segments: bool = Query(True),
+    sampling: str | None = None,
+    rerank_alpha: float | None = Query(None, ge=0.0, le=1.0),
+):
+    if video_service is None:
+        return _api_error("Video service unavailable", "video_unavailable")
+    try:
+        payload = video_service.search(
+            query=query,
+            top_k=top_k,
+            mode=mode,
+            sampling_strategy=sampling,
+            rerank=rerank,
+            return_segments=return_segments,
+            rerank_alpha=rerank_alpha,
+        )
+        return {"ok": True, "modality": "video", **payload}
+    except Exception as exc:
+        return _api_error(str(exc), "video_search_error")
+
+
+@app.post("/video/reverse-search")
+def video_reverse_search(payload: dict):
+    if video_service is None:
+        return _api_error("Video service unavailable", "video_unavailable")
+    try:
+        result = video_service.reverse_search(
+            video_id=payload.get("video_id"),
+            video_path=payload.get("video_path"),
+            top_k=int(payload.get("top_k", 5)),
+            mode=payload.get("mode", "video"),
+        )
+        return {"ok": True, "modality": "video", **result}
+    except Exception as exc:
+        return _api_error(str(exc), "video_reverse_search_error")
+
+
+@app.post("/video/reverse-search-upload")
+async def video_reverse_search_upload(
+    file: UploadFile = File(...),
+    top_k: int = Form(5),
+    mode: str = Form("video"),
+):
+    if video_service is None:
+        return _api_error("Video service unavailable", "video_unavailable")
+
+    suffix = Path(file.filename or "upload.mp4").suffix or ".mp4"
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix,
+            dir=str(VIDEO_UPLOADS_DIR),
+        ) as handle:
+            temp_path = handle.name
+            shutil.copyfileobj(file.file, handle)
+        result = video_service.reverse_search(
+            video_path=temp_path,
+            top_k=top_k,
+            mode=mode,
+        )
+        return {"ok": True, "modality": "video", **result}
+    except Exception as exc:
+        return _api_error(str(exc), "video_reverse_search_upload_error")
+    finally:
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+@app.post("/video/rag")
+def video_rag(payload: dict):
+    if video_service is None:
+        return _api_error("Video service unavailable", "video_unavailable")
+    query = str(payload.get("query") or "").strip()
+    results = payload.get("results") or []
+    model = payload.get("model")
+    if not query:
+        return _api_error("Missing query", "missing_query")
+    if not isinstance(results, list) or not results:
+        return _api_error("Missing video results", "missing_results")
+    try:
+        return {"ok": True, "modality": "video", **video_service.rag(query=query, results=results, model_name=model)}
+    except Exception as exc:
+        return _api_error(str(exc), "video_rag_error")
+
+
+@app.get("/video/metrics/summary")
+def video_metrics_summary(limit: int = 1000):
+    if video_service is None:
+        return _api_error("Video service unavailable", "video_unavailable")
+    return {"ok": True, **video_service.metrics_summary(limit=limit)}
 
 
 @app.get("/metrics")
