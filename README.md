@@ -11,6 +11,8 @@ It combines:
 - benchmark artifacts for latency and retrieval quality analysis
 - CLI tools for text-to-video retrieval, video-to-text retrieval, and evaluation
 
+Portfolio case study: https://cristiancolacel.com/projects/multimodal-semantic-search-rag
+
 ## What Problem This Solves
 
 Traditional keyword search is a poor fit for images and videos. Users ask for meaning, scenes, actions, and concepts, while media files usually expose only weak metadata.
